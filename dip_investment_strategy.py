@@ -4,6 +4,7 @@ import calendar
 import matplotlib.pyplot as plt
 import backtrader as bt
 import yfinance as yf
+import collections
 
 
 def cal_max_drawdown(nav):
@@ -26,23 +27,43 @@ class ChannelIndicator(bt.Indicator):
 
     def __init__(self):
         super(ChannelIndicator, self).__init__()
-        # 计算价格序列的斜率
-        x = np.arange(self.p.window)
-        y = self.data.close.get(size=self.p.window)
-        slope, intercept = np.polyfit(x, y, 1)
+        
+        # 创建缓冲区来存储历史数据
+        self.buffer = collections.deque(maxlen=self.p.window)
+        
+        # 初始化通道线
+        self.lines.upper = bt.LineNum(0)
+        self.lines.middle = bt.LineNum(0)
+        self.lines.lower = bt.LineNum(0)
 
-        # 计算价格到趋势线的距离
-        trend_line = slope * x + intercept
-        distances = y - trend_line
+    def next(self):
+        # 添加当前价格到缓冲区
+        self.buffer.append(self.data.close[0])
+        
+        # 只有当缓冲区满时才计算通道
+        if len(self.buffer) == self.p.window:
+            # 计算价格序列的斜率
+            x = np.arange(self.p.window)
+            y = np.array(self.buffer)
+            slope, intercept = np.polyfit(x, y, 1)
 
-        # 计算上下轨的距离（取最大距离的80%）
-        upper_distance = np.percentile(distances, 80)
-        lower_distance = np.percentile(distances, 20)
+            # 计算价格到趋势线的距离
+            trend_line = slope * x + intercept
+            distances = y - trend_line
 
-        # 生成通道线
-        self.lines.upper = trend_line + upper_distance
-        self.lines.middle = trend_line
-        self.lines.lower = trend_line + lower_distance
+            # 计算上下轨的距离（取最大距离的80%）
+            upper_distance = np.percentile(distances, 80)
+            lower_distance = np.percentile(distances, 20)
+
+            # 更新通道线
+            self.lines.upper[0] = trend_line[-1] + upper_distance
+            self.lines.middle[0] = trend_line[-1]
+            self.lines.lower[0] = trend_line[-1] + lower_distance
+        else:
+            # 缓冲区未满时，使用当前价格作为通道值
+            self.lines.upper[0] = self.data.close[0]
+            self.lines.middle[0] = self.data.close[0]
+            self.lines.lower[0] = self.data.close[0]
 
 
 class DipStrategy(bt.Strategy):
@@ -235,7 +256,7 @@ def backtest_strategy(
     cerebro.broker.setcash(initial_cash)
 
     # 设置手续费
-    # cerebro.broker.setcommission(commission=0.0003)  # 0.03% 手续费
+    cerebro.broker.setcommission(commission=0.0003)  # 0.03% 手续费
 
     # 运行回测
     print("初始资金: %.2f" % cerebro.broker.getvalue())
