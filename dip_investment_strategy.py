@@ -18,186 +18,74 @@ def cal_max_drawdown(nav):
     return np.max(drawdown)
 
 
-class ChannelIndicator(bt.Indicator):
-    """
-    双轨通道指标
-    """
-    lines = ('upper', 'middle', 'lower',)
-    params = (('window', 20),)
-
-    def __init__(self):
-        super(ChannelIndicator, self).__init__()
-        
-        # 创建缓冲区来存储历史数据
-        self.buffer = collections.deque(maxlen=self.p.window)
-        
-        # 初始化通道线
-        self.lines.upper = bt.LineNum(0)
-        self.lines.middle = bt.LineNum(0)
-        self.lines.lower = bt.LineNum(0)
-
-    def next(self):
-        # 添加当前价格到缓冲区
-        self.buffer.append(self.data.close[0])
-        
-        # 只有当缓冲区满时才计算通道
-        if len(self.buffer) == self.p.window:
-            # 计算价格序列的斜率
-            x = np.arange(self.p.window)
-            y = np.array(self.buffer)
-            slope, intercept = np.polyfit(x, y, 1)
-
-            # 计算价格到趋势线的距离
-            trend_line = slope * x + intercept
-            distances = y - trend_line
-
-            # 计算上下轨的距离（取最大距离的80%）
-            upper_distance = np.percentile(distances, 80)
-            lower_distance = np.percentile(distances, 20)
-
-            # 更新通道线
-            self.lines.upper[0] = trend_line[-1] + upper_distance
-            self.lines.middle[0] = trend_line[-1]
-            self.lines.lower[0] = trend_line[-1] + lower_distance
-        else:
-            # 缓冲区未满时，使用当前价格作为通道值
-            self.lines.upper[0] = self.data.close[0]
-            self.lines.middle[0] = self.data.close[0]
-            self.lines.lower[0] = self.data.close[0]
-
-
-class DipStrategy(bt.Strategy):
+class GridStrategy(bt.Strategy):
     params = (
         ("symbol", "SH512890"),
-        ("base_amount", 10000),
-        ("dip_threshold", -0.01),
-        ("upper_sell_threshold", 0.95),
+        ("base_amount", 10000),  # 每个网格的投资金额
+        ("grid_size", 0.02),     # 网格大小（价格间距）
+        ("grid_number", 10),     # 网格数量
+        ("price_range", None),   # 价格区间 (min_price, max_price)
     )
 
     def __init__(self):
-        self.monthly_trigger_conditions = []
-        self.monthly_investments = 0
-        self.channel = ChannelIndicator(self.data0)
-        self.data = self.get_data(self.data0)
+        self.grid_prices = []  # 存储网格价格
+        self.grid_positions = {}  # 存储每个网格的持仓
+        self.last_price = None  # 上一次的价格
         
-    def get_data(self, data):
-        # 将 backtrader 数据转换为 pandas DataFrame
-        df = pd.DataFrame(
-            {
-                "close": data.close.array,
-                "open": data.open.array,
-                "high": data.high.array,
-                "low": data.low.array,
-                "volume": data.volume.array,
-            },
-            index=data.datetime.array,
-        )
-        return df
+        # 如果没有指定价格区间，使用历史数据的最高最低价
+        if self.p.price_range is None:
+            self.p.price_range = (
+                min(self.data0.low.get(size=100)),
+                max(self.data0.high.get(size=100))
+            )
+        
+        # 计算网格价格
+        min_price, max_price = self.p.price_range
+        price_step = (max_price - min_price) / self.p.grid_number
+        self.grid_prices = [min_price + i * price_step for i in range(self.p.grid_number + 1)]
+        
+        # 初始化每个网格的持仓
+        for price in self.grid_prices:
+            self.grid_positions[price] = 0
+            
+        print(f"网格价格: {self.grid_prices}")
 
-    def is_last_day_of_third_week(self, date):
-        """
-        判断是否是当月第三周的最后一天
-        """
-        year = date.year
-        month = date.month
-        cal = calendar.monthcalendar(year, month)
-        
-        # 获取第三周
-        third_week = cal[2]
-        
-        # 找到第三周最后一个非零日期
-        last_day = 0
-        for day in reversed(third_week):
-            if day != 0:
-                last_day = day
-                break
-        
-        is_last = date.day == last_day
-        print(f"检查第三周最后一天 - 日期: {date}, 是否最后一天: {is_last}, 最后一天日期: {last_day}")
-        return is_last
-
-    def get_monthly_position(self, data, middle_line):
-        """
-        计算月中位置相对于中轨的情况
-        """
-        # 将 backtrader 数据转换为 pandas DataFrame
-        df = self.get_data(data)
-        days_in_month = len(df)
-        days_below_middle = sum(df["close"] < middle_line)
-        return days_below_middle / days_in_month
+    def get_grid_index(self, price):
+        """获取价格所在的网格索引"""
+        for i in range(len(self.grid_prices) - 1):
+            if self.grid_prices[i] <= price <= self.grid_prices[i + 1]:
+                return i
+        return -1
 
     def next(self):
-        # 获取当前数据
-        current_date = self.data0.datetime.date(0)
         current_price = self.data0.close[0]
+        current_date = self.data0.datetime.date(0)
         
-        # 获取通道值
-        current_upper = self.channel.upper[0]
-        current_lower = self.channel.lower[0]
-        current_middle = self.channel.middle[0]
-        
-        # 检查是否需要卖出
-        if current_price >= current_upper * self.p.upper_sell_threshold:
-            print(f"卖出信号 - 日期: {current_date}, 价格: {current_price}, 上轨: {current_upper}")
-            # 卖出50%的持仓
-            self.order_target_percent(data=self.data0, target=0.5)
+        if self.last_price is None:
+            self.last_price = current_price
             return
-
-        # 计算当日涨跌幅
-        if len(self.data0) > 1:
-            daily_return = (current_price - self.data0.close[-1]) / self.data0.close[-1]
-        else:
-            daily_return = 0
-
-        # 判断是否触发投资条件
-        if self.is_last_day_of_third_week(current_date):
-            print(f"第三周最后一天 - 日期: {current_date}")
-            # 重置月度状态
-            self.monthly_trigger_conditions = []
-            self.monthly_investments = 0
-
-        # 条件1：触发下跌，马上买入
-        if (
-            daily_return <= self.p.dip_threshold
-            and 1 not in self.monthly_trigger_conditions
-        ):
-            print(f"条件1触发 - 日期: {current_date}, 日收益率: {daily_return:.2%}")
+            
+        # 获取当前价格所在的网格
+        current_grid = self.get_grid_index(current_price)
+        last_grid = self.get_grid_index(self.last_price)
+        
+        if current_grid == -1 or last_grid == -1:
+            self.last_price = current_price
+            return
+            
+        # 价格下跌，买入
+        if current_grid > last_grid:
+            print(f"买入信号 - 日期: {current_date}, 价格: {current_price:.2f}, 网格: {current_grid}")
             self.buy(data=self.data0, value=self.p.base_amount)
-            self.monthly_trigger_conditions.append(1)
-            self.monthly_investments += 1
-
-        # 条件2：第三周最后一天，如果本月没有触发条件1，则买入
-        elif (
-            self.is_last_day_of_third_week(current_date)
-            and 1 not in self.monthly_trigger_conditions
-        ):
-            print(f"条件2触发 - 日期: {current_date}")
-            self.buy(data=self.data0, value=self.p.base_amount)
-            self.monthly_trigger_conditions.append(2)
-            self.monthly_investments += 1
-
-        # 条件3：月中位置判断，如果本月投资次数小于3次，则增加买入
-        elif (
-            self.is_last_day_of_third_week(current_date)
-            and self.get_monthly_position(self.data0, current_middle) >= 0.5
-            and self.monthly_investments < 3
-        ):
-            monthly_pos = self.get_monthly_position(self.data0, current_middle)
-            print(f"条件3触发 - 日期: {current_date}, 月中位置: {monthly_pos:.2%}")
-            self.buy(data=self.data0, value=self.p.base_amount)
-            self.monthly_trigger_conditions.append(3)
-            self.monthly_investments += 1
-
-        # 条件4：触达下轨，如果本月投资次数小于3次，则增加买入
-        elif (
-            current_price <= current_lower
-            and self.monthly_investments < 3
-            and 4 not in self.monthly_trigger_conditions
-        ):
-            print(f"条件4触发 - 日期: {current_date}, 价格: {current_price}, 下轨: {current_lower}")
-            self.buy(data=self.data0, value=self.p.base_amount)
-            self.monthly_trigger_conditions.append(4)
-            self.monthly_investments += 1
+            self.grid_positions[self.grid_prices[current_grid]] += 1
+            
+        # 价格上涨，卖出
+        elif current_grid < last_grid:
+            print(f"卖出信号 - 日期: {current_date}, 价格: {current_price:.2f}, 网格: {current_grid}")
+            self.sell(data=self.data0, value=self.p.base_amount)
+            self.grid_positions[self.grid_prices[current_grid]] -= 1
+            
+        self.last_price = current_price
 
 
 def backtest_strategy(
@@ -205,8 +93,9 @@ def backtest_strategy(
     start_date="2021-01-01",
     end_date=None,
     base_amount=10000,
-    dip_threshold=-0.01,
-    upper_sell_threshold=0.95,
+    grid_size=0.02,
+    grid_number=10,
+    price_range=None,
 ):
     """
     回测策略
@@ -244,11 +133,12 @@ def backtest_strategy(
 
     # 添加策略
     cerebro.addstrategy(
-        DipStrategy,
+        GridStrategy,
         symbol=symbol,
         base_amount=base_amount,
-        dip_threshold=dip_threshold,
-        upper_sell_threshold=upper_sell_threshold,
+        grid_size=grid_size,
+        grid_number=grid_number,
+        price_range=price_range,
     )
 
     # 设置初始资金
