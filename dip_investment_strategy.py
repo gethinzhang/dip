@@ -1,211 +1,330 @@
-import pandas as pd
 import numpy as np
-import calendar
-import matplotlib.pyplot as plt
+import pandas as pd
+from typing import List, Tuple, Dict
+from datetime import datetime
 import backtrader as bt
-import yfinance as yf
-import collections
 
-
-def cal_max_drawdown(nav):
-    nav = np.asarray(nav, dtype=np.float64)
-    peak = np.maximum.accumulate(nav)
-
-    # 只在 peak 非零时计算 drawdown，否则设为 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        drawdown = np.where(peak > 0, (peak - nav) / peak, 0.0)
-
-    return np.max(drawdown)
-
-
-class GridStrategy(bt.Strategy):
-    params = (
-        ("symbol", "SH512890"),
-        ("base_amount", 10000),  # 每个网格的投资金额
-        ("grid_size", 0.02),     # 网格大小（价格间距）
-        ("grid_number", 10),     # 网格数量
-        ("price_range", None),   # 价格区间 (min_price, max_price)
-    )
-
-    def __init__(self):
-        self.grid_prices = []  # 存储网格价格
-        self.grid_positions = {}  # 存储每个网格的持仓
-        self.last_price = None  # 上一次的价格
-        
-        # 如果没有指定价格区间，使用历史数据的最高最低价
-        if self.p.price_range is None:
-            self.p.price_range = (
-                min(self.data0.low.get(size=100)),
-                max(self.data0.high.get(size=100))
-            )
-        
-        # 计算网格价格
-        min_price, max_price = self.p.price_range
-        price_step = (max_price - min_price) / self.p.grid_number
-        self.grid_prices = [min_price + i * price_step for i in range(self.p.grid_number + 1)]
-        
-        # 初始化每个网格的持仓
-        for price in self.grid_prices:
-            self.grid_positions[price] = 0
-            
-        print(f"网格价格: {self.grid_prices}")
-
-    def get_grid_index(self, price):
-        """获取价格所在的网格索引"""
-        for i in range(len(self.grid_prices) - 1):
-            if self.grid_prices[i] <= price <= self.grid_prices[i + 1]:
-                return i
-        return -1
-
-    def next(self):
-        current_price = self.data0.close[0]
-        current_date = self.data0.datetime.date(0)
-        
-        if self.last_price is None:
-            self.last_price = current_price
-            return
-            
-        # 获取当前价格所在的网格
-        current_grid = self.get_grid_index(current_price)
-        last_grid = self.get_grid_index(self.last_price)
-        
-        if current_grid == -1 or last_grid == -1:
-            self.last_price = current_price
-            return
-            
-        # 价格下跌，买入
-        if current_grid > last_grid:
-            print(f"买入信号 - 日期: {current_date}, 价格: {current_price:.2f}, 网格: {current_grid}")
-            self.buy(data=self.data0, value=self.p.base_amount)
-            self.grid_positions[self.grid_prices[current_grid]] += 1
-            
-        # 价格上涨，卖出
-        elif current_grid < last_grid:
-            print(f"卖出信号 - 日期: {current_date}, 价格: {current_price:.2f}, 网格: {current_grid}")
-            self.sell(data=self.data0, value=self.p.base_amount)
-            self.grid_positions[self.grid_prices[current_grid]] -= 1
-            
-        self.last_price = current_price
-
-
-def backtest_strategy(
-    symbol="512890.SS",
-    start_date="2021-01-01",
-    end_date=None,
-    base_amount=10000,
-    grid_size=0.02,
-    grid_number=10,
-    price_range=None,
-):
+def process_backtrader_orders(cerebro) -> List[Dict]:
     """
-    回测策略
+    处理backtrader的交易记录
+    
+    Args:
+        cerebro: backtrader的cerebro对象
+        
+    Returns:
+        处理后的交易记录列表
     """
-    if end_date is None:
-        end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
-
-    # 获取历史数据
-    ticker = yf.Ticker(symbol)
-    data = ticker.history(start=start_date, end=end_date)
+    trades = []
     
-    if data.empty:
-        print(f"No data available for {symbol}")
-        return None
-
-    print(f"数据范围: {data.index[0]} 到 {data.index[-1]}")
-    print(f"数据条数: {len(data)}")
-    print(f"数据样例:\n{data.head()}")
+    # 获取所有交易记录
+    for strategy in cerebro.runstrats:
+        for order in strategy.orders:
+            if order.status == order.Completed:
+                trade = {
+                    'date': order.data.datetime.datetime(0).strftime('%Y-%m-%d'),
+                    'price': order.executed.price,
+                    'size': order.executed.size,
+                    'direction': 'buy' if order.isbuy() else 'sell',
+                    'grid': getattr(order, 'grid_level', 0)  # 从order对象获取网格级别
+                }
+                trades.append(trade)
     
-    # 创建回测
-    cerebro = bt.Cerebro()
+    return trades
 
-    # 添加数据
-    data_feed = bt.feeds.PandasData(
-        dataname=data,
-        datetime=None,  # 使用索引作为日期
-        open="Open",
-        high="High",
-        low="Low",
-        close="Close",
-        volume="Volume",
-        openinterest=-1,
-    )
-    cerebro.adddata(data_feed)
+class InvestmentMetrics:
+    def __init__(self, risk_free_rate: float = 0.03):
+        """
+        初始化投资指标计算类
+        
+        Args:
+            risk_free_rate: 无风险利率，默认3%
+        """
+        self.risk_free_rate = risk_free_rate
+        
+    def calculate_metrics(self, 
+                         portfolio_values: List[float],
+                         cash_flows: List[float],
+                         dates: List[str],
+                         trades: List[Dict] = None) -> Dict:
+        """
+        计算投资组合的量化评估指标
+        
+        Args:
+            portfolio_values: 投资组合每日价值列表
+            cash_flows: 每日现金流列表（正数表示流入，负数表示流出）
+            dates: 对应的日期列表
+            trades: 交易记录列表，每个记录包含日期、价格、数量、方向等信息
+            
+        Returns:
+            包含各项指标的字典
+        """
+        # 转换为numpy数组
+        portfolio_values = np.array(portfolio_values)
+        cash_flows = np.array(cash_flows)
+        
+        # 计算基础指标
+        total_investment = np.sum(cash_flows[cash_flows > 0])
+        final_value = portfolio_values[-1]
+        
+        # 计算每日收益率
+        daily_returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        
+        # 计算累计收益率
+        total_return = (final_value - total_investment) / total_investment
+        
+        # 计算年化收益率
+        days = len(portfolio_values)
+        annual_return = (1 + total_return) ** (252 / days) - 1
+        
+        # 计算最大回撤
+        max_drawdown = self._calculate_max_drawdown(portfolio_values)
+        
+        # 计算风险调整后收益指标
+        sharpe_ratio = self._calculate_sharpe_ratio(daily_returns)
+        sortino_ratio = self._calculate_sortino_ratio(daily_returns)
+        
+        # 计算定投相关指标
+        monthly_irr = self._calculate_monthly_irr(cash_flows)
+        annual_irr = (1 + monthly_irr) ** 12 - 1 if monthly_irr is not None else 0
+        
+        # 计算其他指标
+        win_rate = self._calculate_win_rate(daily_returns)
+        profit_factor = self._calculate_profit_factor(daily_returns)
+        
+        # 计算网格策略特定指标
+        grid_metrics = self._calculate_grid_metrics(trades) if trades else {}
+        
+        return {
+            "total_investment": total_investment,
+            "final_value": final_value,
+            "total_return": total_return,
+            "annual_return": annual_return,
+            "max_drawdown": max_drawdown,
+            "sharpe_ratio": sharpe_ratio,
+            "sortino_ratio": sortino_ratio,
+            "annual_irr": annual_irr,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            **grid_metrics
+        }
+    
+    def _calculate_max_drawdown(self, portfolio_values: np.ndarray) -> float:
+        """计算最大回撤"""
+        peak = np.maximum.accumulate(portfolio_values)
+        drawdown = (peak - portfolio_values) / peak
+        return np.max(drawdown)
+    
+    def _calculate_sharpe_ratio(self, returns: np.ndarray) -> float:
+        """计算夏普比率"""
+        excess_returns = returns - self.risk_free_rate/252
+        return np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
+    
+    def _calculate_sortino_ratio(self, returns: np.ndarray) -> float:
+        """计算索提诺比率"""
+        excess_returns = returns - self.risk_free_rate/252
+        downside_returns = returns[returns < 0]
+        if len(downside_returns) == 0:
+            return 0
+        return np.sqrt(252) * np.mean(excess_returns) / np.std(downside_returns)
+    
+    def _calculate_monthly_irr(self, cash_flows: np.ndarray) -> float:
+        """计算月度IRR"""
+        try:
+            return np.irr(cash_flows)
+        except:
+            return None
+    
+    def _calculate_win_rate(self, returns: np.ndarray) -> float:
+        """计算胜率"""
+        winning_trades = np.sum(returns > 0)
+        total_trades = len(returns)
+        return winning_trades / total_trades if total_trades > 0 else 0
+    
+    def _calculate_profit_factor(self, returns: np.ndarray) -> float:
+        """计算盈亏比"""
+        gains = np.sum(returns[returns > 0])
+        losses = abs(np.sum(returns[returns < 0]))
+        return gains / losses if losses != 0 else float('inf')
+    
+    def _calculate_grid_metrics(self, trades: List[Dict]) -> Dict:
+        """计算网格策略特定指标"""
+        if not trades:
+            return {}
+            
+        # 计算网格交易统计
+        buy_trades = [t for t in trades if t.get('direction') == 'buy']
+        sell_trades = [t for t in trades if t.get('direction') == 'sell']
+        
+        # 计算网格交易收益
+        grid_profits = []
+        grid_profit_details = []
+        
+        # 按网格级别统计
+        grid_levels = {}
+        for trade in trades:
+            grid_level = trade.get('grid', 0)
+            if grid_level not in grid_levels:
+                grid_levels[grid_level] = {'buy': 0, 'sell': 0, 'profit': 0}
+            
+            if trade.get('direction') == 'buy':
+                grid_levels[grid_level]['buy'] += 1
+            else:
+                grid_levels[grid_level]['sell'] += 1
+        
+        # 计算每个网格的收益
+        for i in range(len(sell_trades)):
+            if i < len(buy_trades):
+                buy_price = buy_trades[i].get('price', 0)
+                sell_price = sell_trades[i].get('price', 0)
+                buy_grid = buy_trades[i].get('grid', 0)
+                sell_grid = sell_trades[i].get('grid', 0)
+                
+                profit = (sell_price - buy_price) / buy_price
+                grid_profits.append(profit)
+                
+                grid_profit_details.append({
+                    'buy_grid': buy_grid,
+                    'sell_grid': sell_grid,
+                    'profit': profit,
+                    'buy_price': buy_price,
+                    'sell_price': sell_price
+                })
+                
+                # 更新网格级别统计
+                if buy_grid in grid_levels:
+                    grid_levels[buy_grid]['profit'] += profit
+        
+        # 计算网格策略指标
+        grid_win_rate = len([p for p in grid_profits if p > 0]) / len(grid_profits) if grid_profits else 0
+        avg_grid_profit = np.mean(grid_profits) if grid_profits else 0
+        max_grid_profit = np.max(grid_profits) if grid_profits else 0
+        min_grid_profit = np.min(grid_profits) if grid_profits else 0
+        
+        # 计算网格使用效率
+        grid_usage = {level: stats['buy'] + stats['sell'] for level, stats in grid_levels.items()}
+        most_used_grid = max(grid_usage.items(), key=lambda x: x[1])[0] if grid_usage else 0
+        
+        return {
+            "grid_trades": len(trades),
+            "grid_buy_trades": len(buy_trades),
+            "grid_sell_trades": len(sell_trades),
+            "grid_win_rate": grid_win_rate,
+            "avg_grid_profit": avg_grid_profit,
+            "max_grid_profit": max_grid_profit,
+            "min_grid_profit": min_grid_profit,
+            "grid_levels": grid_levels,
+            "most_used_grid": most_used_grid,
+            "grid_profit_details": grid_profit_details
+        }
 
-    # 添加策略
-    cerebro.addstrategy(
-        GridStrategy,
-        symbol=symbol,
-        base_amount=base_amount,
-        grid_size=grid_size,
-        grid_number=grid_number,
-        price_range=price_range,
-    )
+def format_metrics(metrics: Dict) -> str:
+    """
+    格式化指标输出
+    
+    Args:
+        metrics: 指标字典
+    
+    Returns:
+        格式化后的字符串
+    """
+    base_metrics = f"""
+投资组合表现指标:
+-----------------
+总投资金额: {metrics['total_investment']:,.2f}
+最终价值: {metrics['final_value']:,.2f}
+总收益率: {metrics['total_return']:.2%}
+年化收益率: {metrics['annual_return']:.2%}
+最大回撤: {metrics['max_drawdown']:.2%}
+夏普比率: {metrics['sharpe_ratio']:.2f}
+索提诺比率: {metrics['sortino_ratio']:.2f}
+定投年化收益率: {metrics['annual_irr']:.2%}
+胜率: {metrics['win_rate']:.2%}
+盈亏比: {metrics['profit_factor']:.2f}
+"""
+    
+    # 如果有网格策略指标，添加网格策略部分
+    if 'grid_trades' in metrics:
+        grid_metrics = f"""
+网格策略指标:
+-----------------
+总交易次数: {metrics['grid_trades']}
+买入交易次数: {metrics['grid_buy_trades']}
+卖出交易次数: {metrics['grid_sell_trades']}
+网格胜率: {metrics['grid_win_rate']:.2%}
+平均网格收益: {metrics['avg_grid_profit']:.2%}
+最大网格收益: {metrics['max_grid_profit']:.2%}
+最小网格收益: {metrics['min_grid_profit']:.2%}
+最活跃网格: {metrics['most_used_grid']}
 
-    # 设置初始资金
-    initial_cash = 10000000
-    cerebro.broker.setcash(initial_cash)
+网格级别统计:
+"""
+        # 添加每个网格级别的统计信息
+        for level, stats in sorted(metrics['grid_levels'].items()):
+            grid_metrics += f"""
+网格 {level}:
+  买入次数: {stats['buy']}
+  卖出次数: {stats['sell']}
+  总收益: {stats['profit']:.2%}
+"""
+        
+        return base_metrics + grid_metrics
+    
+    return base_metrics
 
-    # 设置手续费
-    cerebro.broker.setcommission(commission=0.0003)  # 0.03% 手续费
+def analyze_dca_performance(portfolio_values: List[float],
+                          cash_flows: List[float],
+                          dates: List[str],
+                          trades: List[Dict] = None,
+                          risk_free_rate: float = 0.03) -> str:
+    """
+    分析定投策略表现
+    
+    Args:
+        portfolio_values: 投资组合每日价值列表
+        cash_flows: 每日现金流列表
+        dates: 对应的日期列表
+        trades: 交易记录列表
+        risk_free_rate: 无风险利率
+        
+    Returns:
+        格式化后的分析结果
+    """
+    metrics_calculator = InvestmentMetrics(risk_free_rate)
+    metrics = metrics_calculator.calculate_metrics(portfolio_values, cash_flows, dates, trades)
+    return format_metrics(metrics)
 
-    # 运行回测
-    print("初始资金: %.2f" % cerebro.broker.getvalue())
-    cerebro.run()
-    print("最终资金: %.2f" % cerebro.broker.getvalue())
-
-    # 绘制结果
-    cerebro.plot(style="candlestick")
-    plt.savefig("backtest_result.png")
-    plt.close()
-
-    # 获取回测结果
-    portfolio_value = cerebro.broker.getvalue()
-    trades = cerebro.broker.get_orders()
-
-    # 计算最大回撤
-    max_drawdown = cal_max_drawdown(data["Close"])
-
-    # 计算年化收益率
-    total_return = (portfolio_value - initial_cash) / initial_cash
-    years = (data.index[-1] - data.index[0]).days / 365
-    annual_return = (1 + total_return) ** (1 / years) - 1
-
-    # 计算卡玛比率
-    kama_ratio = annual_return / abs(max_drawdown)
-
-    # 打印回测结果
-    print("\n=== 回测结果 ===")
-    print(f"回测期间: {start_date} 至 {end_date}")
-    print(f"最终资金: {portfolio_value:,.2f}")
-    print(f"年化收益率: {annual_return*100:.2f}%")
-    print(f"最大回撤: {max_drawdown*100:.2f}%")
-    print(f"卡玛比率: {kama_ratio:.2f}")
-    print(f"总交易次数: {len(trades)}")
-
-    # 计算benchmark
-    benchmark_shares = initial_cash / data["Close"].iloc[0]
-    benchmark_value = benchmark_shares * data["Close"].iloc[-1]
-    benchmark_return = (benchmark_value - initial_cash) / initial_cash
-    benchmark_annual_return = (1 + benchmark_return) ** (1 / years) - 1
-
-    print("\n== benchmark ==")
-    print(f"benchmark 持仓数量: {benchmark_shares:.2f}")
-    print(f"benchmark 最终资金: {benchmark_value:,.2f}")
-    print(f"benchmark 年化收益率: {benchmark_annual_return*100:.2f}%")
-
-    return {
-        "portfolio_value": portfolio_value,
-        "trades": trades,
-        "annual_return": annual_return,
-        "max_drawdown": max_drawdown,
-        "kama_ratio": kama_ratio,
-    }
-
-
-def main():
-    # 执行回测
-    backtest_strategy(start_date="2021-01-01")
-
-
+# 使用示例
 if __name__ == "__main__":
-    main()
+    # 示例数据
+    portfolio_values = [10000, 10200, 10100, 10300, 10500]
+    cash_flows = [10000, 1000, 1000, 1000, 1000]
+    dates = ['2023-01-01', '2023-01-02', '2023-01-03', '2023-01-04', '2023-01-05']
+    
+    # 示例交易记录
+    trades = [
+        {'date': '2023-01-02', 'price': 1.02, 'direction': 'buy', 'grid': 1},
+        {'date': '2023-01-03', 'price': 1.01, 'direction': 'sell', 'grid': 0},
+        {'date': '2023-01-04', 'price': 1.03, 'direction': 'buy', 'grid': 2},
+        {'date': '2023-01-05', 'price': 1.05, 'direction': 'sell', 'grid': 1}
+    ]
+    
+    # 分析定投表现
+    result = analyze_dca_performance(portfolio_values, cash_flows, dates, trades)
+    print(result)
+
+# 在网格策略回测后
+cerebro = bt.Cerebro()
+# ... 设置策略和其他参数 ...
+cerebro.run()
+
+# 获取并处理交易记录
+trades = process_backtrader_orders(cerebro)
+
+# 分析策略表现
+result = analyze_dca_performance(
+    portfolio_values=portfolio_values,
+    cash_flows=cash_flows,
+    dates=dates,
+    trades=trades
+)
+print(result) 
